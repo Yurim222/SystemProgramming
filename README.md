@@ -1,6 +1,4 @@
-This is my git repository for posting my assignment code in studying System Programming.
----
-# hw01
+## hw01
 This is the assembly code that performs "Cows and Bulls".
 Among the "Cows and Bulls", the code only performs the logic on the low.
 
