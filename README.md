@@ -1,4 +1,3 @@
-## SystemProgramming
 This is my git repository for posting my assignment code in studying System Programming.
 ---
 # hw01
