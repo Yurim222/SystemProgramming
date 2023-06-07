@@ -1,1 +1,410 @@
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <string.h>
+#include <time.h>
+#include <pthread.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
 
+#define BUFFER_MAX 3
+#define DIRECTION_MAX 45
+
+#define IN 0
+#define OUT 1
+#define PWM 0
+
+#define LOW 0
+#define HIGH 1
+#define VALUE_MAX 256
+
+#define POUT 23
+#define PIN 24
+
+#define PINM 17
+#define PINP 26 //Press sensor's GPIO PIN number
+
+int mot_person = 0;
+int pre_person = 0;
+double distance = 0;
+int personCheck[3] = {0,0,0};
+pthread_t thread1, thread2, thread3, thread4;
+
+//소켓연결
+int serv_sock, clnt_sock = -1;
+struct sockaddr_in serv_addr, clnt_addr;
+socklen_t clnt_addr_size;
+char msg[2];
+
+void error_handling(char *message){
+    fputs(message, stderr);
+    fputc('\n',stderr);
+    exit(1);
+}
+
+static int GPIOExport(int pin){
+#define BUFFER_MAX 3
+    char buffer[BUFFER_MAX];
+    ssize_t bytes_written;
+    int fd;
+
+    fd = open("/sys/class/gpio/export", O_WRONLY); //경로를 열어서
+    if(-1 == fd){
+        fprintf(stderr, "Failed to open export for writing!\n");
+        return(-1);
+    }// 잘 못 열면(경로가 잘못됐거나 값이 없거나 .. etc) => 오류 msg 출력
+
+    bytes_written = snprintf(buffer, BUFFER_MAX, "%d", pin); //파라미터로 입력받은 pin 넘버 buffer에 넘겨서 bytes_written 변수에 저장
+    write(fd, buffer, bytes_written); //fd에 buffer값 넣어서 fd(/sys/class/gpio/export/)에 write => 결과 : /sys/class/gpio/gpio(PIN_number)가 생성됨
+    close(fd);
+    return(0);
+} // 해당 함수는 /sys/class/gpio/export에 GPIO Pin Number을 Write하는 함수입니다
+
+
+static int GPIOUnexport(int pin){
+    char buffer[BUFFER_MAX];
+    ssize_t bytes_written;
+    int fd;
+
+    fd = open("/sys/class/gpio/unexport", O_WRONLY);
+    if(-1 == fd){
+        fprintf(stderr, "Failed to open unexport for writing!\n");
+        return(-1);
+    }
+    bytes_written = snprintf(buffer, BUFFER_MAX, "%d", pin);
+    write(fd, buffer, bytes_written);
+    close(fd);
+    return(0);
+}// 해당 함수는 /sys/class/gpio/unexport에 GPIO Pin Number을 Write하는 함수입니다. //logic은 GPIOexport함수와 같습니다.
+
+static int GPIODirection(int pin, int dir){
+    static const char s_directions_str[] = "in\0out";
+
+    //char path[DIRECTION_MAX] = "/sys/class/gpio/gpio24/direction";
+    char path[DIRECTION_MAX] = "/sys/class/gpio/gpio%d/direction"; //경로 지정
+    int fd;
+    snprintf(path, DIRECTION_MAX, "/sys/class/gpio/gpio%d/direction", pin); // %d에 pin 넘버 넘겨받음
+    fd = open(path, O_WRONLY);
+    if(-1 == fd){
+        fprintf(stderr, "Failed to open gpio direction for writing!\n");
+        return(-1);
+    }
+    if(-1 == write(fd, &s_directions_str[IN == dir ? 0 : 3], IN == dir ? 2 : 3)){ // fd에 IN 또는 OUT 값 입력
+        fprintf(stderr, "Failed to set direction!\n");
+        close(fd);
+        return(-1);
+    }
+    close(fd);
+    return(0);
+}// 해당 함수는 /sys/class/gpio/gpio(pin번호)/direction에 OUT인지, IN인지 write하는 함수
+
+static int GPIORead(int pin){
+    char path[VALUE_MAX];
+    char value_str[3];
+    int fd;
+
+    snprintf(path, VALUE_MAX, "/sys/class/gpio/gpio%d/value", pin);
+    fd = open(path, O_RDONLY);
+    if(-1 == fd){
+        fprintf(stderr, "Failed to open gpio value for reading!\n");
+        return(-1);
+    }
+    if(-1 == read(fd, value_str, 3)){
+        fprintf(stderr, "Failed to read value!\n");
+        close(fd);
+        return(-1);
+    }
+    close(fd);
+    return(atoi(value_str));
+}// 해당 함수는 /sys/class/gpio/gpio(pin번호)/direction에 OUT인지, IN인지 write하는 함수
+
+static int GPIOWrite(int pin, int value){
+    static const char s_values_str[] = "01";//0또는 1로 입력받음
+
+    char path[VALUE_MAX];
+    int fd;
+    snprintf(path, VALUE_MAX, "/sys/class/gpio/gpio%d/value", pin); //pin 번호를 입력받아서 path에 저장
+    fd = open(path, O_WRONLY); //fd에 입력받은 path값을 이용해 파일 엶.
+    if(-1 == fd){
+        fprintf(stderr, "Failed to open gpio value for writing!\n"); // 접근 오류 -> 메세지 출력
+        return(-1);
+    }
+    if(1 != write(fd, &s_values_str[LOW == value ? 0 : 1], 1)){ //0또는 1 값 입력, 그런데 만약 실패하면 오류메세지 출력
+        fprintf(stderr, "Failed to write value!\n");
+        close(fd);
+        return(-1);
+    }
+    close(fd);
+    return(0);
+}// 해당 함수는 /sys/class/gpio/gpio(pin번호)/value에 (0또는 1) 값을 쓰는 함수) //ex. value/0 => led가 켜짐
+
+
+void* motion() {
+
+    int repeat = 1000;
+    /*clock_t start_t, end_t;
+    clock_t n_per_st, n_per_en;
+    int cnt=0;
+    double time;*/
+    int flag_detect=0;
+
+    if(-1 == GPIOExport(PINM)){
+        printf("gpio export err\n");
+    }
+
+    usleep(100000);
+
+    if(-1 == GPIODirection(PINM, IN)){
+        printf("gpio direction err\n");
+        exit(2);
+    }
+
+    //GPIOWrite(PINM, 0);
+    usleep(10000);
+
+    do{
+        
+        /*if(-1 == GPIOWrite(PINM,1)){
+            printf("gpio write/trigger erro\n");
+            exit(3);
+        }
+        usleep(100);*/
+        /*GPIOWrite(PINM,0);*/
+        printf("GPIORead's number : %d\n", GPIORead(PINM));
+        if(GPIORead(PINM)==0){
+            flag_detect++;
+            printf("flag_detection: %d\n", flag_detect);
+            if(flag_detect==10){
+                printf("Don't exist person!\n");
+                mot_person=0;
+                personCheck[0]=mot_person;
+                printf("personCheck[0]=%d!\n", personCheck[0]);
+            }
+        }else{
+            flag_detect=0;
+            printf("!!Exist person!\n");
+            mot_person=1;
+            personCheck[0]=mot_person;
+            printf("personCheck[0]=%d!\n", personCheck[0]);
+        }
+       
+        usleep(2000000);
+    }
+    while(repeat--);
+
+    if(-1 == GPIOUnexport(PINM))
+    exit(4);
+
+    printf("complete\n");
+    exit(0);
+
+}
+
+void* microwave() {
+
+    int repeat = 100;
+    clock_t start_t, end_t;
+    double wave_time;
+    int cnt;
+    int wav_person;
+
+    if(-1 == GPIOExport(POUT) || -1 == GPIOExport(PIN)){
+        printf("gpio export err\n");
+    }
+
+    usleep(100000);
+
+    if(-1 == GPIODirection(POUT, OUT) || -1 == GPIODirection(PIN, IN)){
+        printf("gpio direction err\n");
+        exit(2);
+    }
+
+    GPIOWrite(POUT, 0);
+    usleep(10000);
+
+    do{
+        if(-1 == GPIOWrite(POUT,1)){
+            printf("gpio write/trigger erro\n");
+            exit(3);
+        }
+        usleep(10);
+        GPIOWrite(POUT,0);
+
+        while(GPIORead(PIN)==0){
+            start_t = clock();
+        }
+        while(GPIORead(PIN)==1){
+            end_t = clock();
+        }
+        wave_time = (double)(end_t-start_t)/CLOCKS_PER_SEC;
+        double speedOfSound = 34000.0; // cm/s
+        double distanceInCm = (wave_time * speedOfSound) /2;
+        //double distanceInMm = distanceInCm * 10;
+        printf("time : %.4lf\n", wave_time);
+        printf("distance : %.4lfcm\n", distanceInCm);
+        //printf("distance : %.4lfmm\n", distanceInMm);
+
+        if(distanceInCm <= 10){
+            cnt++;
+            printf("cnt:%d\n",cnt);
+            if(cnt==10){
+                printf("person exists\n");
+                wav_person=1; //person exists
+                personCheck[1]=wav_person;
+                printf("personCheck[1]=%d!\n", personCheck[1]);
+            }
+            
+        }else{
+                cnt=0;
+                printf("person not exists!\n");
+                wav_person=0;
+                personCheck[1]=wav_person;
+                printf("personCheck[1]=%d!\n", personCheck[1]);
+
+            }
+        
+        usleep(2000000);
+    }
+    while(repeat--);
+
+    if(-1 == GPIOUnexport(POUT)||-1==GPIOUnexport(PIN))
+    exit(4);
+
+    printf("complete\n");
+    exit(0);
+
+}
+
+void* press()
+{
+    int repeat = 1000;
+    
+     if(-1 == GPIOExport(PINP)){
+        printf("gpio export err\n");
+    }
+
+    usleep(100000);
+
+    if(-1 == GPIODirection(PINP, IN)){
+        printf("gpio direction err\n");
+        exit(2);
+    }
+
+    //GPIOWrite(PIN, 0);
+    usleep(10000);
+
+    do{
+        
+        /*if(-1 == GPIOWrite(PIN,1)){
+            printf("gpio write/trigger erro\n");
+            return(3);
+        }
+        usleep(100);*/
+        /*GPIOWrite(PIN,0);*/
+        if(GPIORead(PINP)==0){
+            printf("Pressure is not Detected!\n");
+            pre_person=0;
+            personCheck[2]=pre_person;
+            printf("personCheck[2]=%d!\n", personCheck[2]);
+
+        }else{
+            printf("Presure is detected!\n");
+            pre_person=1;
+            personCheck[2]=pre_person;
+            printf("personCheck[2]=%d!\n", personCheck[2]);
+
+        }
+       
+        usleep(2000000);
+    }
+    while(repeat--);
+
+    if(-1 == GPIOUnexport(PINP))
+    exit(4);
+
+    printf("complete\n");
+    exit(0);
+}
+
+void* superviser(void * arg)
+{
+    
+
+    while(1) {
+        sleep(1);
+        // for ( int i = 0; i < 3; i++ ) {
+        //     printf("personCheck[%d] = %d\n",i, personCheck[i]);
+        // }
+
+        int existValue = 0;
+        int count = 0;
+        for ( int a = 0; a < 3; a++ ) {
+            if ( personCheck[a] == 1 ) {
+                count++;
+            }
+        }
+        
+        if ( count >=2 ) {
+            existValue = 1;
+        }
+        
+        if ( existValue == 1 ) {
+            printf("supervisor detect exists\n");
+            snprintf(msg, 2, "%d", existValue);
+            write(clnt_sock, msg, sizeof(msg));
+            printf("msg = %s\n", msg);
+        }else{
+            existValue = 0;
+            printf("supervisor detect person not exists!\n");
+            snprintf(msg, 2, "%d", existValue);
+            write(clnt_sock, msg, sizeof(msg));
+            printf("msg = %s\n", msg);
+        }
+
+    }
+}
+
+
+int main(int argc, char *argv[]) {
+    pthread_create(&thread1, NULL, motion, NULL);
+    pthread_create(&thread2, NULL, microwave, NULL);
+    pthread_create(&thread3, NULL, press, NULL);
+    pthread_create(&thread4, NULL, superviser, NULL);
+
+
+    printf("success");
+    if(argc!=2){
+        printf("Usage: %s <port>\n", argv[0]);
+    }
+
+    serv_sock = socket(PF_INET, SOCK_STREAM,0);
+    if(serv_sock == -1){
+        error_handling("socket() error");
+    }
+    memset(&serv_addr, 0, sizeof(serv_addr));
+    serv_addr.sin_family = AF_INET;
+    serv_addr.sin_addr.s_addr=htonl(INADDR_ANY);
+    serv_addr.sin_port=htons(atoi(argv[1]));
+
+     if(bind(serv_sock, (struct sockaddr*) &serv_addr, sizeof(serv_addr))== -1){
+        error_handling("bind() error");
+    }
+
+    if(listen(serv_sock, 5) == -1) error_handling("listen() error");
+    if(clnt_sock < 0){
+        clnt_addr_size = sizeof(clnt_addr);
+        clnt_sock = accept(serv_sock, (struct sockaddr*)&clnt_addr, &clnt_addr_size);
+        if(clnt_sock == -1) error_handling("accept() error");
+    }
+
+
+
+    pthread_join(thread1, NULL);
+    pthread_join(thread2, NULL);
+    pthread_join(thread3, NULL);
+    pthread_join(thread4, NULL);
+
+}
